@@ -1,0 +1,280 @@
+// NodeMCU V3 (ESP8266) + L298N AA034 — BEST READY-TO-USE
+// ✦ Wi-Fi บ้าน + mDNS (esp-car.local) + AP fallback
+// ✦ เว็บคอนโทรล: ปุ่ม + คีย์บอร์ดกดค้าง + สถานะ + Toggle กลับทิศล้อ
+// ✦ Auto-Stop ปลอดภัย
+// ✦ OPTIONAL: PWM ปรับความเร็วจริงที่ ENA/ENB (เปิดด้วย USE_PWM=1)
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
+
+// ---------- CONFIG ----------
+const char* ssid     = "Thiraphat_2.4G";   // <<< แก้เป็น Wi-Fi บ้าน
+const char* password = "MAM0814865460";    // <<< แก้เป็นรหัส Wi-Fi บ้าน
+const char* HOSTNAME = "esp-car";
+
+// เปิด 1 ถ้าจะใช้ PWM ที่ ENA/ENB (ต้องต่อ ENA->D7, ENB->D8 และเอาจัมเปอร์ออก)
+#define USE_PWM 0
+
+// ---------- Pins (IN1..IN4) ----------
+#define R_IN1 D1  // GPIO5  -> IN1 (Right)
+#define R_IN2 D2  // GPIO4  -> IN2 (Right)
+#define L_IN1 D5  // GPIO14 -> IN3 (Left)
+#define L_IN2 D6  // GPIO12 -> IN4 (Left)
+
+#if USE_PWM
+  #define ENA D7  // GPIO13 -> ENA (Right)
+  #define ENB D8  // GPIO15 -> ENB (Left) (strap ต้อง LOW ตอนบูต)
+#endif
+
+// ---------- Globals ----------
+ESP8266WebServer server(80);
+unsigned long lastCmd = 0;
+const unsigned long AUTO_STOP_MS = 1500;
+bool invertLeft  = false;
+bool invertRight = false;
+
+#if USE_PWM
+int maxPWM = 900;       // 0..1023 (ปรับจากหน้าเว็บ)
+#endif
+
+// ---------- Motor primitives ----------
+void stopAll() {
+#if USE_PWM
+  analogWrite(ENA, 0); analogWrite(ENB, 0);
+#endif
+  digitalWrite(R_IN1, LOW); digitalWrite(R_IN2, LOW);
+  digitalWrite(L_IN1, LOW); digitalWrite(L_IN2, LOW);
+}
+
+#if USE_PWM
+inline int clampi(int v, int lo, int hi){ return v<lo?lo:(v>hi?hi:v); }
+
+// Set wheel with direction + PWM (speed 0..1023)
+void setRight(bool forward, int speed){
+  bool f = forward ^ invertRight;
+  digitalWrite(R_IN1, f ? HIGH : LOW);
+  digitalWrite(R_IN2, f ? LOW  : HIGH);
+  analogWrite(ENA, clampi(speed,0,1023));
+}
+void setLeft(bool forward, int speed){
+  bool f = forward ^ invertLeft;
+  digitalWrite(L_IN1, f ? HIGH : LOW);
+  digitalWrite(L_IN2, f ? LOW  : HIGH);
+  analogWrite(ENB, clampi(speed,0,1023));
+}
+#endif
+
+// High-level motions
+void forward() {
+#if USE_PWM
+  setRight(true,  maxPWM);
+  setLeft (true,  maxPWM);
+#else
+  bool rf = true ^ invertRight;
+  bool lf = true ^ invertLeft;
+  digitalWrite(R_IN1, rf?HIGH:LOW); digitalWrite(R_IN2, rf?LOW:HIGH);
+  digitalWrite(L_IN1, lf?HIGH:LOW); digitalWrite(L_IN2, lf?LOW:HIGH);
+#endif
+}
+void backward() {
+#if USE_PWM
+  setRight(false, maxPWM);
+  setLeft (false, maxPWM);
+#else
+  bool rf = false ^ invertRight;
+  bool lf = false ^ invertLeft;
+  digitalWrite(R_IN1, rf?HIGH:LOW); digitalWrite(R_IN2, rf?LOW:HIGH);
+  digitalWrite(L_IN1, lf?HIGH:LOW); digitalWrite(L_IN2, lf?LOW:HIGH);
+#endif
+}
+void turnLeft() {    // ขวาไปหน้า / ซ้ายถอย
+#if USE_PWM
+  setRight(true,  maxPWM);
+  setLeft (false, maxPWM);
+#else
+  bool rf = true  ^ invertRight;
+  bool lf = false ^ invertLeft;
+  digitalWrite(R_IN1, rf?HIGH:LOW); digitalWrite(R_IN2, rf?LOW:HIGH);
+  digitalWrite(L_IN1, lf?HIGH:LOW); digitalWrite(L_IN2, lf?LOW:HIGH);
+#endif
+}
+void turnRight() {   // ขวาถอย / ซ้ายไปหน้า
+#if USE_PWM
+  setRight(false, maxPWM);
+  setLeft (true,  maxPWM);
+#else
+  bool rf = false ^ invertRight;
+  bool lf = true  ^ invertLeft;
+  digitalWrite(R_IN1, rf?HIGH:LOW); digitalWrite(R_IN2, rf?LOW:HIGH);
+  digitalWrite(L_IN1, lf?HIGH:LOW); digitalWrite(L_IN2, lf?LOW:HIGH);
+#endif
+}
+
+// ---------- Web UI ----------
+const char PAGE[] PROGMEM = R"HTML(
+<!doctype html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP Car</title>
+<style>
+  body{margin:0;height:100vh;display:grid;place-items:center;background:#0b0f14;color:#e8eef6;font-family:system-ui}
+  .g{display:grid;grid-template-columns:96px 96px 96px;gap:12px;justify-items:center;align-items:center}
+  button{width:96px;height:96px;border:none;border-radius:16px;background:#121922;color:#e8eef6;font-size:22px;box-shadow:0 6px 18px rgba(0,0,0,.45)}
+  button:active{transform:scale(.98)}
+  .stop{background:#5a1a1a}
+  .row{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:10px}
+  .pill{padding:8px 12px;border-radius:999px;background:#1b2532;border:none;color:#e8eef6}
+  .hint{margin-top:8px;opacity:.75;font-size:12px;text-align:center;max-width:440px}
+  .ip{font-size:12px;opacity:.6;margin-top:6px;text-align:center}
+  .slider{width:260px}
+</style>
+</head><body>
+  <div>
+    <div class="g">
+      <div></div><button id="f">↑</button><div></div>
+      <button id="l">←</button><button id="s" class="stop">STOP</button><button id="r">→</button>
+      <div></div><button id="b">↓</button><div></div>
+    </div>
+    <div class="row">
+      <button class="pill" id="flipL">Flip Left</button>
+      <button class="pill" id="flipR">Flip Right</button>
+      <button class="pill" id="status">Status</button>
+    </div>
+#ifPWM
+    <div class="row">
+      <span class="hint">ความเร็วสูงสุด</span>
+      <input id="spd" class="slider" type="range" min="300" max="1023" step="1" value="900">
+    </div>
+#endif
+    <div class="hint">
+      กดค้าง = วิ่ง • ปล่อย = หยุด • คีย์บอร์ด: ↑/↓/←/→ หรือ WASD • Space = STOP
+    </div>
+    <div class="ip" id="ip"></div>
+  </div>
+<script>
+function send(u){fetch(u,{cache:'no-store'}).then(r=>r.text()).then(t=>{if(u==='/status') document.getElementById('ip').textContent=t;}).catch(()=>{});}
+function hold(id, path){
+  const el=document.getElementById(id);
+  el.addEventListener('pointerdown',()=>send(path));
+  ['pointerup','pointercancel','mouseleave','touchend','mouseup','blur']
+    .forEach(ev=>el.addEventListener(ev,()=>send('/s')));
+}
+hold('f','/f'); hold('b','/b'); hold('l','/l'); hold('r','/r');
+document.getElementById('s').onclick=()=>send('/s');
+document.getElementById('flipL').onclick=()=>send('/flip?side=left');
+document.getElementById('flipR').onclick=()=>send('/flip?side=right');
+document.getElementById('status').onclick=()=>send('/status');
+#ifPWM
+const spd=document.getElementById('spd'); spd.oninput=()=>send('/spd?m='+spd.value);
+#endif
+
+// Keyboard hold + keep-alive resend
+const keyset=new Set(); let active=null; let last=0;
+function pick(){
+  if(keyset.has('Space')) return '/s';
+  if(keyset.has('ArrowUp')||keyset.has('KeyW')) return '/f';
+  if(keyset.has('ArrowDown')||keyset.has('KeyS')) return '/b';
+  if(keyset.has('ArrowLeft')||keyset.has('KeyA')) return '/l';
+  if(keyset.has('ArrowRight')||keyset.has('KeyD')) return '/r';
+  return null;
+}
+function update(){ const next=pick(); if(next!==active){ active=next; send(active?active:'/s'); } }
+addEventListener('keydown',e=>{
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','KeyW','KeyA','KeyS','KeyD','Space'].includes(e.code)){
+    e.preventDefault(); if(e.code==='Space'){ keyset.clear(); active=null; send('/s'); return; }
+    keyset.add(e.code); update();
+  }
+});
+addEventListener('keyup',e=>{
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','KeyW','KeyA','KeyS','KeyD','Space'].includes(e.code)){
+    keyset.delete(e.code); update();
+  }
+});
+setInterval(()=>{ if(active && performance.now()-last>350){ send(active); last=performance.now(); }}, 120);
+send('/status');
+</script>
+</body></html>
+)HTML";
+
+// ---------- Wi-Fi with AP fallback ----------
+void connectOrAP(){
+  WiFi.mode(WIFI_STA);
+  WiFi.hostname(HOSTNAME);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi "); Serial.print(ssid);
+  unsigned long t0=millis();
+  while(WiFi.status()!=WL_CONNECTED && millis()-t0<10000){ delay(400); Serial.print("."); }
+  if(WiFi.status()==WL_CONNECTED){
+    Serial.println("\nConnected! IP: "+WiFi.localIP().toString());
+    if(MDNS.begin(HOSTNAME)){ MDNS.addService("http","tcp",80); Serial.println("mDNS: http://"+String(HOSTNAME)+".local"); }
+  }else{
+    Serial.println("\nWi-Fi failed. Starting AP...");
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("ESPcar","12345678");
+    Serial.print("AP IP: "); Serial.println(WiFi.softAPIP()); // 192.168.4.1
+  }
+}
+
+// ---------- HTTP handlers ----------
+void sendOK(){ server.send(200,"text/plain","OK"); }
+void handleRoot(){ server.send_P(200,"text/html",PAGE); }
+void doCmd(void(*fn)()){ fn(); lastCmd=millis(); sendOK(); }
+
+void handleFlip(){
+  if(!server.hasArg("side")) { server.send(400,"text/plain","missing side"); return; }
+  String s=server.arg("side"); s.toLowerCase();
+  if(s=="left")  invertLeft=!invertLeft;
+  if(s=="right") invertRight=!invertRight;
+  server.send(200,"text/plain", String("invertL=")+(invertLeft?"true":"false")+" | invertR="+(invertRight?"true":"false"));
+}
+void handleStatus(){
+  String msg="IP="+(WiFi.getMode()==WIFI_STA?WiFi.localIP().toString():WiFi.softAPIP().toString());
+#if USE_PWM
+  msg+=" | maxPWM="+String(maxPWM);
+#endif
+  msg+=" | invertL="+String(invertLeft?"true":"false");
+  msg+=" | invertR="+String(invertRight?"true":"false");
+  server.send(200,"text/plain",msg);
+}
+#if USE_PWM
+void handleSpd(){
+  if(!server.hasArg("m")){ server.send(400,"text/plain","missing m"); return; }
+  maxPWM = clampi(server.arg("m").toInt(), 300, 1023);
+  sendOK();
+}
+#endif
+
+// ---------- Setup / Loop ----------
+void setup(){
+  Serial.begin(115200);
+  pinMode(R_IN1,OUTPUT); pinMode(R_IN2,OUTPUT);
+  pinMode(L_IN1,OUTPUT); pinMode(L_IN2,OUTPUT);
+#if USE_PWM
+  pinMode(ENA,OUTPUT); pinMode(ENB,OUTPUT);
+  analogWriteRange(1023);
+  analogWriteFreq(2000);  // PWM เนียน
+#endif
+  stopAll();
+
+  connectOrAP();
+
+  server.on("/", handleRoot);
+  server.on("/f", [](){ doCmd(forward); });
+  server.on("/b", [](){ doCmd(backward); });
+  server.on("/l", [](){ doCmd(turnLeft); });
+  server.on("/r", [](){ doCmd(turnRight); });
+  server.on("/s", [](){ stopAll(); server.send(200,"text/plain","STOP"); });
+  server.on("/flip", handleFlip);
+  server.on("/status", handleStatus);
+#if USE_PWM
+  server.on("/spd", handleSpd);
+#endif
+  server.begin();
+  Serial.println("HTTP server ready");
+}
+
+void loop(){
+  server.handleClient();
+  MDNS.update();
+  if(millis()-lastCmd > AUTO_STOP_MS) stopAll();
+}
